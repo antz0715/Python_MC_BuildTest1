@@ -27,7 +27,9 @@ import io
 import json
 import math
 import os
+import shutil
 import sys
+import tempfile
 import zlib
 
 import tkinter as tk
@@ -3321,6 +3323,221 @@ def run_self_tests():
           and no_grid.size == (40, 24)
           and no_grid.tobytes() == doc9.image.resize((40, 24), NEAREST).tobytes())
 
+    # --------------------------------------------------------------------- #
+    # Packaging checks: these exercise the parts of the environment that a
+    # frozen build (PyInstaller) can get wrong - Pillow's PNG codec, the
+    # project file format, and the Tk/Pillow bridge used to draw the canvas.
+    # --------------------------------------------------------------------- #
+    temp_dir = tempfile.mkdtemp(prefix="pixel_editor_selftest_")
+    try:
+        # A real PNG written to and read back from disk.
+        doc10 = PixelDocument(24, 18)
+        doc10.write_pixels([(0, 0), (23, 17), (7, 3)], (200, 40, 90, 255))
+        doc10.set_pixel(1, 1, (0, 0, 0, 0))
+        png_path = os.path.join(temp_dir, "roundtrip.png")
+        doc10.build_export_image(1).save(png_path, "PNG")
+        with Image.open(png_path) as handle:
+            handle.load()
+            reloaded = handle.convert("RGBA")
+        check("Files: PNG saved to disk reloads with identical pixels and size",
+              reloaded.size == (24, 18)
+              and reloaded.tobytes() == doc10.image.tobytes()
+              and reloaded.getpixel((1, 1))[3] == 0,
+              f"{reloaded.size} {os.path.getsize(png_path)} bytes")
+
+        # The .pxproj container: JSON with a base64-encoded PNG payload.
+        buffer = io.BytesIO()
+        doc10.image.save(buffer, "PNG")
+        project = {
+            "format": "pixel_editor_project",
+            "version": 1,
+            "width": doc10.width,
+            "height": doc10.height,
+            "zoom": 8,
+            "color": rgba_hex((1, 2, 3, 4)),
+            "recent_colors": [rgba_hex((5, 6, 7, 8))],
+            "image_png_base64": base64.b64encode(buffer.getvalue()).decode("ascii"),
+        }
+        project_path = os.path.join(temp_dir, "roundtrip" + PROJECT_EXT)
+        with open(project_path, "w", encoding="utf-8") as handle:
+            json.dump(project, handle)
+        with open(project_path, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        payload = base64.b64decode(loaded["image_png_base64"])
+        with Image.open(io.BytesIO(payload)) as handle:
+            handle.load()
+            restored = handle.convert("RGBA")
+        check("Files: project round trip keeps the canvas size and every pixel",
+              loaded["format"] == "pixel_editor_project"
+              and (loaded["width"], loaded["height"]) == (24, 18)
+              and restored.tobytes() == doc10.image.tobytes()
+              and parse_hex_color(loaded["color"]) == (1, 2, 3, 4),
+              f"{os.path.getsize(project_path)} bytes")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    check("Dialogs: file, colour and message dialogs are importable",
+          all(callable(func) for func in (filedialog.askopenfilename,
+                                          filedialog.asksaveasfilename,
+                                          colorchooser.askcolor,
+                                          messagebox.showerror)))
+
+    results.extend(run_gui_smoke_tests())
+    return results
+
+
+def check_imagetk_bridge(root, check):
+    """Verify the Tk/Pillow bridge that render() relies on to show the canvas."""
+    preview = PixelDocument(8, 6)
+    preview.set_pixel(2, 2, (255, 255, 255, 255))
+    scaled = preview.image.resize((8 * 16, 6 * 16), NEAREST)
+    photo = ImageTk.PhotoImage(scaled, master=root)
+    ok = (photo.width(), photo.height()) == (128, 96)
+    del photo
+    check("Display: Tk and PIL.ImageTk render a scaled canvas bitmap", ok,
+          "128 x 96 PhotoImage")
+
+
+def run_gui_smoke_tests():
+    """Drive the real tools in an invisible window: drawing, zooming, export.
+
+    Everything shares a single Tk root. When an editor is already running
+    (Help > Run Self-Tests) only the display check runs, because building a
+    second application instance inside a live one is not safe.
+    """
+    results = []
+
+    def check(name, condition, detail=""):
+        ok = bool(condition)
+        text = f"[{'PASS' if ok else 'FAIL'}] {name}"
+        if detail:
+            text += f" - {detail}"
+        results.append((ok, text))
+        return ok
+
+    if ImageTk is None:
+        check("Display: PIL.ImageTk is available", False, "ImageTk failed to import")
+        return results
+
+    live_root = getattr(tk, "_default_root", None)
+    if live_root is not None:
+        try:
+            check_imagetk_bridge(live_root, check)
+        except tk.TclError as exc:
+            check("Display: Tk and PIL.ImageTk render a scaled canvas bitmap",
+                  False, f"Tcl/Tk error: {exc}")
+        results.append((True, "[SKIP] GUI smoke tests (an editor is already open; "
+                              "run --selftest from a command line to include them)"))
+        return results
+
+    temp_dir = tempfile.mkdtemp(prefix="pixel_editor_gui_")
+    root = None
+    try:
+        root = tk.Tk()
+        root.attributes("-alpha", 0.0)    # realised (so widgets get real sizes)
+        root.geometry("1000x760+40+40")   # but fully transparent, so invisible
+        check_imagetk_bridge(root, check)
+        app = PixelEditorApp(root, 64, 64)
+        root.update()
+        app.set_zoom(8)
+        app.center_view()
+        root.update()
+        check("GUI: editor window builds with a 64 x 64 canvas",
+              app.doc.size == (64, 64) and app.canvas.winfo_width() > 200,
+              f"viewport={app.canvas.winfo_width()}x{app.canvas.winfo_height()}")
+
+        class FakeEvent:
+            """Stand-in for a Tk mouse event (x, y and modifier state)."""
+
+            def __init__(self, x, y, state=0):
+                self.x, self.y, self.state, self.delta = x, y, state, 0
+
+        def event_at(px, py):
+            sx, sy = app.viewport.pixel_to_screen(px, py)
+            half = app.viewport.zoom // 2
+            return FakeEvent(sx + half, sy + half)
+
+        def use_tool(tool, points):
+            app.set_tool(tool)
+            app.on_press(event_at(*points[0]))
+            for point in points[1:]:
+                app.on_drag(event_at(*point))
+            app.on_release(event_at(*points[-1]))
+            root.update()
+
+        app.set_color((255, 80, 0, 255))
+        use_tool("pencil", [(2, 2), (10, 2), (10, 10)])
+        check("GUI: pencil paints the dragged pixels",
+              app.doc.get_pixel(2, 2) == (255, 80, 0, 255)
+              and app.doc.get_pixel(6, 2) == (255, 80, 0, 255)
+              and app.doc.get_pixel(10, 10) == (255, 80, 0, 255))
+
+        use_tool("line", [(0, 20), (30, 44)])
+        midpoint = bresenham_line(0, 20, 30, 44)[15]
+        check("GUI: line tool commits a rasterized line",
+              app.doc.get_pixel(*midpoint)[3] == 255, f"mid={midpoint}")
+
+        app.shape_fill.set(False)
+        use_tool("ellipse", [(34, 4), (60, 30)])
+        ring = [p for p in ellipse_outline_pixels(34, 4, 60, 30)
+                if app.doc.get_pixel(*p)[3] == 255]
+        check("GUI: ellipse tool commits an outline",
+              len(ring) == len(ellipse_outline_pixels(34, 4, 60, 30)),
+              f"{len(ring)} pixels")
+
+        before_size = app.doc.size
+        app.zoom_step(1)
+        app.zoom_step(1)
+        zoomed = app.viewport.percent
+        app.zoom_step(-1)
+        root.update()
+        check("GUI: zooming in and out never changes the resolution",
+              app.doc.size == before_size and zoomed > 800
+              and app.viewport.percent < zoomed,
+              f"{zoomed}% -> {app.viewport.percent}%, canvas {app.doc.size}")
+
+        undo_before = app.doc.can_undo()
+        app.undo()
+        redo_ok = app.doc.can_redo()
+        app.redo()
+        check("GUI: undo and redo work on committed shapes",
+              undo_before and redo_ok and app.doc.get_pixel(*midpoint)[3] == 255)
+
+        native_path = os.path.join(temp_dir, "native.png")
+        scaled_path = os.path.join(temp_dir, "scaled8x.png")
+        app.doc.build_export_image(1).save(native_path, "PNG")
+        app.doc.build_export_image(8).save(scaled_path, "PNG")
+        with Image.open(native_path) as handle:
+            handle.load()
+            native = handle.convert("RGBA")
+        with Image.open(scaled_path) as handle:
+            handle.load()
+            scaled_size = handle.size
+        check("GUI: export writes a native PNG identical to the canvas",
+              native.size == (64, 64) and native.tobytes() == app.doc.image.tobytes(),
+              f"{native.size}")
+        check("GUI: export at 8x writes 512 x 512", scaled_size == (512, 512),
+              f"{scaled_size}")
+
+        # Reopen the exported PNG the way open_png does.
+        with Image.open(native_path) as handle:
+            handle.load()
+            reopened = handle.convert("RGBA")
+        document = PixelDocument(reopened.size[0], reopened.size[1], reopened)
+        app.load_document(document)
+        root.update()
+        check("GUI: the exported PNG reopens at its native size with its pixels",
+              app.doc.size == (64, 64)
+              and app.doc.image.tobytes() == native.tobytes())
+    except tk.TclError as exc:
+        check("GUI: editor window can be created", False, f"Tcl/Tk error: {exc}")
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
     return results
 
 
@@ -3328,19 +3545,36 @@ def run_self_tests():
 # Entry point
 # --------------------------------------------------------------------------- #
 
+def report_startup_text(title: str, text: str) -> None:
+    """Write a console report, or show a dialog when there is no console.
+
+    A PyInstaller --windowed build has no stdout, so `--selftest` and startup
+    errors would otherwise be invisible when run from PixelEditor.exe.
+    """
+    if sys.stdout is not None:
+        print(text)
+        return
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showinfo(title, text, parent=root)
+    root.destroy()
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--selftest" in argv or "--self-test" in argv:
         results = run_self_tests()
-        for _ok, line in results:
-            print(line)
         failed = sum(1 for ok, _line in results if not ok)
-        print(f"\n{len(results) - failed} passed, {failed} failed")
+        report = "\n".join(line for _ok, line in results)
+        report += f"\n\n{len(results) - failed} passed, {failed} failed"
+        report_startup_text(f"{APP_NAME} self-tests", report)
         return 1 if failed else 0
 
     if ImageTk is None:
-        print("Pillow's ImageTk module is not available.\n"
-              "Install/upgrade Pillow with Tk support:  pip install --upgrade pillow")
+        report_startup_text(
+            APP_NAME,
+            "Pillow's ImageTk module is not available.\n"
+            "Install/upgrade Pillow with Tk support:  pip install --upgrade pillow")
         return 2
 
     root = tk.Tk()

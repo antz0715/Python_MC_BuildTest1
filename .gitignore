@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# PyInstaller intermediate output
+build/
+*.spec
+
+# Note: dist/ is intentionally NOT ignored, so you can still decide whether
+# dist/PixelEditor.exe should be committed or attached to a release instead.
